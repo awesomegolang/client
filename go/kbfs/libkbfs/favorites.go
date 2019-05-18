@@ -580,6 +580,10 @@ func (f *Favorites) Shutdown() error {
 	f.muShutdown.Lock()
 	defer f.muShutdown.Unlock()
 	f.shutdown = true
+	err := f.wg.Wait(context.Background())
+	if err != nil {
+		return err
+	}
 	close(f.reqChan)
 	close(f.bufferedReqChan)
 	if f.diskCache != nil {
@@ -589,7 +593,7 @@ func (f *Favorites) Shutdown() error {
 				"Could not close disk favorites cache: %v", err)
 		}
 	}
-	return f.wg.Wait(context.Background())
+	return nil
 }
 
 func (f *Favorites) hasShutdown() bool {
@@ -741,7 +745,9 @@ const (
 // the favorites cache has not been initialized at all and cannot serve any
 // requests until this refresh is completed.
 func (f *Favorites) RefreshCache(ctx context.Context, mode FavoritesRefreshMode) {
+	f.wg.Add(1)
 	if f.disabled || f.hasShutdown() {
+		f.wg.Done()
 		return
 	}
 
@@ -751,6 +757,7 @@ func (f *Favorites) RefreshCache(ctx context.Context, mode FavoritesRefreshMode)
 	case f.refreshWaiting <- struct{}{}:
 	default:
 		// There is already a refresh in the queue
+		f.wg.Done()
 		return
 	}
 	// This request is non-blocking, so use a throw-away done channel
@@ -762,7 +769,6 @@ func (f *Favorites) RefreshCache(ctx context.Context, mode FavoritesRefreshMode)
 		done:    make(chan struct{}),
 		ctx:     context.Background(),
 	}
-	f.wg.Add(1)
 
 	if mode == FavoritesRefreshModeBlocking {
 		favResult, err := f.config.KBPKI().FavoriteList(ctx)
@@ -798,6 +804,13 @@ func (f *Favorites) RefreshCache(ctx context.Context, mode FavoritesRefreshMode)
 // does so with rate-limiting, so that it doesn't hit the server too
 // often.
 func (f *Favorites) RefreshCacheWhenMTimeChanged(ctx context.Context) {
+	// Add ourselves to the waitgroup during the execution of this
+	// function, to prevent races with `Shutdown`.  But we don't want
+	// to stay in the wait group while buffered, since that could take
+	// up to 5s and that's not ok during a test.
+	f.wg.Add(1)
+	defer f.wg.Done()
+
 	if f.disabled || f.hasShutdown() {
 		return
 	}
